@@ -4,15 +4,18 @@ Serves the single-page UI and runs rescore jobs in the background.
 One credit = one completed job. Credits are tracked per browser cookie
 (no login yet); new visitors start with 3 free songs.
 """
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -67,6 +70,45 @@ def spend_credit(user_id: str) -> bool:
     return True
 
 
+def refund_credit(user_id: str) -> None:
+    c = _db()
+    c.execute("UPDATE users SET credits=credits+1 WHERE user_id=?",
+              (user_id,))
+    c.commit()
+    c.close()
+
+
+# ---------------------------------------------------------------- security
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+MAX_JOBS_PER_USER = 2
+JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_url(url: str) -> bool:
+    """SSRF guard: only http(s) URLs whose host resolves to a public IP.
+    Blocks localhost, private/LAN, link-local, and cloud-metadata IPs."""
+    try:
+        p = urllib.parse.urlparse(url)
+        if p.scheme not in ("http", "https"):
+            return False
+        host = p.hostname
+        if not host or host == "localhost":
+            return False
+        for info in socket.getaddrinfo(host, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast):
+                return False
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _check_job_id(job_id: str) -> None:
+    if not JOB_ID_RE.match(job_id):
+        raise HTTPException(400, "Bad job id.")
+
+
 # ---------------------------------------------------------------- jobs
 # job_id -> dict(status, progress, stage, error, out_file, created)
 jobs: dict[str, dict] = {}
@@ -112,20 +154,19 @@ def _run_job(job_id: str, user_id: str, url: str | None,
         proc.wait()
         with jobs_lock:
             if proc.returncode == 0 and out.exists():
-                if spend_credit(user_id):
-                    jobs[job_id]["status"] = "done"
-                    jobs[job_id]["progress"] = 100
-                    jobs[job_id]["stage"] = "Done"
-                else:
-                    jobs[job_id]["status"] = "error"
-                    jobs[job_id]["error"] = "Out of credits."
+                # credit was reserved at creation; keep the deduction
+                jobs[job_id]["status"] = "done"
+                jobs[job_id]["progress"] = 100
+                jobs[job_id]["stage"] = "Done"
             else:
                 jobs[job_id]["status"] = "error"
                 jobs[job_id]["error"] = "The engine failed. Try another song."
+                refund_credit(user_id)
     except Exception as e:  # noqa: BLE001
         with jobs_lock:
             jobs[job_id]["status"] = "error"
             jobs[job_id]["error"] = str(e)
+        refund_credit(user_id)
 
 
 def _ensure_user(user_id: str | None) -> str:
@@ -147,24 +188,50 @@ async def create_job(url: str | None = Form(default=None),
                      file: UploadFile | None = File(default=None),
                      user_id: str | None = Cookie(default=None)):
     uid = _ensure_user(user_id)
-    if credits_for(uid) <= 0:
-        raise HTTPException(402, "Out of credits. Buy more to continue.")
     if not url and not file:
         raise HTTPException(400, "Give a link or upload a file.")
+    if url and not _validate_url(url):
+        raise HTTPException(400, "That link is not allowed.")
     if layers not in ("dum,clap", "dum", "none"):
         raise HTTPException(400, "Bad layers value.")
+    # reserve one credit up front: prevents the race where N parallel
+    # jobs all pass the balance check and all complete on 1 credit
+    if not spend_credit(uid):
+        raise HTTPException(402, "Out of credits. Buy more to continue.")
+    with jobs_lock:
+        running = sum(1 for j in jobs.values()
+                      if j["status"] == "running"
+                      and j.get("user_id") == uid)
+    if running >= MAX_JOBS_PER_USER:
+        refund_credit(uid)
+        raise HTTPException(429, "Too many jobs running. Wait for one to finish.")
     job_id = uuid.uuid4().hex[:12]
     upload_path = None
     if file is not None:
         job_dir = JOBS / job_id
         job_dir.mkdir(exist_ok=True)
         upload_path = str(job_dir / ("input" + Path(file.filename).suffix))
-        with open(upload_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+        # size-capped streaming read: never buffer an unbounded upload
+        size = 0
+        try:
+            with open(upload_path, "wb") as f:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        raise HTTPException(413, "File too large (max 100MB).")
+                    f.write(chunk)
+        except HTTPException:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            refund_credit(uid)
+            raise
     with jobs_lock:
         jobs[job_id] = {"status": "running", "progress": 0,
                         "stage": "Starting", "error": None,
-                        "out_file": None, "created": time.time()}
+                        "out_file": None, "created": time.time(),
+                        "user_id": uid}
     t = threading.Thread(target=_run_job, args=(
         job_id, uid, url, upload_path, layers, dum_db, clap_db),
         daemon=True)
@@ -174,6 +241,7 @@ async def create_job(url: str | None = Form(default=None),
 
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str):
+    _check_job_id(job_id)
     with jobs_lock:
         j = jobs.get(job_id)
     if j is None:
@@ -190,6 +258,7 @@ def job_status(job_id: str):
 
 @app.get("/api/jobs/{job_id}/audio")
 def job_audio(job_id: str):
+    _check_job_id(job_id)
     out = JOBS / job_id / "output.wav"
     if not out.exists():
         raise HTTPException(404, "Audio not ready.")
