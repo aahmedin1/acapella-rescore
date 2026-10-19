@@ -20,3 +20,5 @@ Thumbs.db
 
 # yt-dlp URL downloads
 acapella-url-*/
+web/jobs/
+web/credits.db
