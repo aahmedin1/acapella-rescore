@@ -1,0 +1,16 @@
+# Don't bake these into the image: COPY . /app would otherwise ship the
+# local test credits DB (with its test user) and any local job outputs.
+.git
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+web/__pycache__/
+web/jobs/
+web/credits.db
+*.wav
+*.mp3
+*.flac
+*.ogg
+/tmp/
+.DS_Store
