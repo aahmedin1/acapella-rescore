@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Acapella Rescore</title>
+<style>
+  :root { --bg:#121212; --card:#1e1e1e; --text:#f0f0f0; --muted:#aaa;
+          --accent:#e8b34b; --green:#4caf50; --red:#e57373; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font-family:system-ui,-apple-system,sans-serif; }
+  main { max-width:640px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:1.6rem; margin:0 0 4px; }
+  p.sub { color:var(--muted); margin:0 0 24px; }
+  .credits { float:right; color:var(--accent); font-weight:600; }
+  .card { background:var(--card); border-radius:12px; padding:20px;
+          margin-bottom:16px; }
+  label { display:block; font-weight:600; margin-bottom:6px; }
+  input[type=text], input[type=url] { width:100%; padding:12px;
+          border:1px solid #444; border-radius:8px; background:#2a2a2a;
+          color:var(--text); font-size:1rem; }
+  input[type=file] { width:100%; }
+  .or { text-align:center; color:var(--muted); margin:12px 0; }
+  .levels { display:flex; gap:8px; flex-wrap:wrap; }
+  .levels label { font-weight:400; background:#2a2a2a; padding:10px 14px;
+          border-radius:999px; cursor:pointer; }
+  .levels input { accent-color:var(--accent); }
+  .slider-row { margin-top:14px; }
+  .slider-row output { color:var(--accent); font-weight:600; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  button { background:var(--accent); color:#121212; border:0;
+          padding:14px 20px; border-radius:999px; font-size:1rem;
+          font-weight:700; width:100%; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  .job { margin-top:16px; }
+  .bar { height:10px; background:#333; border-radius:999px; overflow:hidden; }
+  .bar > div { height:100%; background:var(--accent); width:0%;
+          transition:width .4s; }
+  .stage { color:var(--muted); margin:8px 0; }
+  .error { color:var(--red); }
+  audio { width:100%; margin-top:12px; }
+  a.download { display:inline-block; margin-top:12px; color:var(--accent); }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <span class="credits" id="credits"></span>
+  <h1>Acapella Rescore</h1>
+  <p class="sub">Music out. Voice kept. Hand-played duff groove underneath.</p>
+
+  <div class="card">
+    <label for="url">Song link</label>
+    <input type="url" id="url" placeholder="https://youtube.com/watch?v=…">
+    <div class="or">— or —</div>
+    <label for="file">Upload an audio file</label>
+    <input type="file" id="file" accept="audio/*">
+  </div>
+
+  <div class="card">
+    <label>Beats</label>
+    <div class="levels">
+      <label><input type="radio" name="layers" value="dum,clap" checked> DUMs + Claps</label>
+      <label><input type="radio" name="layers" value="dum"> DUMs only</label>
+      <label><input type="radio" name="layers" value="none"> Audio only</label>
+    </div>
+    <div class="slider-row" id="dum-row">
+      <label>DUM loudness <output id="dum-out">+0 dB</output></label>
+      <input type="range" id="dum-db" min="-12" max="12" step="1" value="0">
+    </div>
+    <div class="slider-row" id="clap-row">
+      <label>Clap loudness <output id="clap-out">+0 dB</output></label>
+      <input type="range" id="clap-db" min="-12" max="12" step="1" value="0">
+    </div>
+  </div>
+
+  <button id="go">Rescore it (1 credit)</button>
+  <p class="error" id="err"></p>
+
+  <div class="job hidden" id="job">
+    <div class="bar"><div id="bar-fill"></div></div>
+    <p class="stage" id="stage">Starting…</p>
+    <audio id="player" controls class="hidden"></audio>
+    <br><a class="download hidden" id="dl" href="#">Download WAV</a>
+  </div>
+</main>
+<script>
+let userId = localStorage.getItem('ar_user');
+async function refreshCredits() {
+  const h = userId ? { 'Cookie': 'user_id=' + userId } : {};
+  const r = await fetch('/api/credits', { headers: h, credentials: 'same-origin' });
+  const d = await r.json();
+  userId = d.user_id; localStorage.setItem('ar_user', userId);
+  document.cookie = 'user_id=' + userId + '; path=/; max-age=31536000';
+  document.getElementById('credits').textContent = d.credits + ' credits left';
+}
+function syncSliders() {
+  const layers = document.querySelector('input[name=layers]:checked').value;
+  document.getElementById('dum-row').classList.toggle('hidden', layers === 'none');
+  document.getElementById('clap-row').classList.toggle('hidden', layers !== 'dum,clap');
+}
+document.querySelectorAll('input[name=layers]').forEach(
+  el => el.addEventListener('change', syncSliders));
+document.getElementById('dum-db').addEventListener('input', e => {
+  document.getElementById('dum-out').textContent =
+    (e.target.value >= 0 ? '+' : '') + e.target.value + ' dB';
+});
+document.getElementById('clap-db').addEventListener('input', e => {
+  document.getElementById('clap-out').textContent =
+    (e.target.value >= 0 ? '+' : '') + e.target.value + ' dB';
+});
+document.getElementById('go').addEventListener('click', async () => {
+  const err = document.getElementById('err'); err.textContent = '';
+  const url = document.getElementById('url').value.trim();
+  const file = document.getElementById('file').files[0];
+  if (!url && !file) { err.textContent = 'Paste a link or pick a file.'; return; }
+  const btn = document.getElementById('go'); btn.disabled = true;
+  const fd = new FormData();
+  if (url) fd.append('url', url);
+  if (file) fd.append('file', file);
+  fd.append('layers', document.querySelector('input[name=layers]:checked').value);
+  fd.append('dum_db', document.getElementById('dum-db').value);
+  fd.append('clap_db', document.getElementById('clap-db').value);
+  const r = await fetch('/api/jobs', { method: 'POST', body: fd, credentials: 'same-origin' });
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    err.textContent = d.detail || 'Could not start the job.';
+    btn.disabled = false; return;
+  }
+  const { job_id } = await r.json();
+  const box = document.getElementById('job'); box.classList.remove('hidden');
+  const poll = setInterval(async () => {
+    const s = await (await fetch('/api/jobs/' + job_id)).json();
+    document.getElementById('bar-fill').style.width = s.progress + '%';
+    document.getElementById('stage').textContent = s.stage;
+    if (s.status === 'done') {
+      clearInterval(poll); btn.disabled = false;
+      const p = document.getElementById('player');
+      p.src = '/api/jobs/' + job_id + '/audio'; p.classList.remove('hidden');
+      const dl = document.getElementById('dl');
+      dl.href = '/api/jobs/' + job_id + '/audio'; dl.classList.remove('hidden');
+      refreshCredits();
+    } else if (s.status === 'error') {
+      clearInterval(poll); btn.disabled = false;
+      err.textContent = s.error || 'Job failed.';
+    }
+  }, 2000);
+});
+syncSliders(); refreshCredits();
+</script>
+</body>
+</html>
