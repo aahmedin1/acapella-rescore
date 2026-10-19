@@ -1,0 +1,16 @@
+# Core
+numpy
+scipy
+soundfile
+librosa
+
+# Source separation (Demucs-compatible)
+torch
+
+# Link input
+yt-dlp
+
+# Web UI (phase 2)
+# gradio
+# fastapi
+# uvicorn
