@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Audio (large; don't commit renders)
+*.wav
+*.mp3
+*.flac
+*.ogg
+!groove_ref.json
+
+# Temp / OS
+/tmp/
+*.tmp
+.DS_Store
+Thumbs.db
+
+# yt-dlp URL downloads
+acapella-url-*/
