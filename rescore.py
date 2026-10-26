@@ -1033,12 +1033,13 @@ def _auto_shift(groove_mono: np.ndarray, sr: int, beats: np.ndarray) -> int:
 
 
 def separate_long(separate, mix: np.ndarray, sr: int,
-                  chunk_sec: float = 30.0, overlap_sec: float = 2.0
+                  chunk_sec: float = 7.0, overlap_sec: float = 2.0
                   ) -> np.ndarray:
     """Separate a long mix in overlapping chunks with crossfade stitching.
 
     The separator is built for short windows; feeding it minutes of audio
     at once silently dies, so chunk it like the live pipeline does.
+    Chunk is 7s because htdemucs models cap valid_length at ~7.8s.
     """
     n = mix.shape[1]
     chunk = int(chunk_sec * sr)
@@ -1061,10 +1062,11 @@ def separate_long(separate, mix: np.ndarray, sr: int,
 
 
 def separate_long_stems(separate, mix: np.ndarray, sr: int,
-                        chunk_sec: float = 30.0, overlap_sec: float = 2.0
+                        chunk_sec: float = 7.0, overlap_sec: float = 2.0
                         ) -> dict:
     """Chunked separation returning {stem_name: (C, N)} in a single pass,
-    with the same overlap-crossfade stitching as separate_long."""
+    with the same overlap-crossfade stitching as separate_long.
+    Chunk is 7s because htdemucs models cap valid_length at ~7.8s."""
     n = mix.shape[1]
     chunk = int(chunk_sec * sr)
     ov = int(overlap_sec * sr)
