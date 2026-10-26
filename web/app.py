@@ -134,6 +134,7 @@ def _run_job(job_id: str, user_id: str, url: str | None,
     cmd = [PY, str(ENGINE), "--out", str(out),
            "--perc-db", "13", "--backing", "haas-vocal",
            "--kit", "duff", "--groove", "lifted",
+           "--no-single-submodel",
            "--layers", layers,
            "--dum-db", str(dum_db), "--clap-db", str(clap_db)]
     if url:
