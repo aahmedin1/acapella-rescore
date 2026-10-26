@@ -1207,6 +1207,8 @@ def main() -> None:
                     help="force the classic grid pattern instead of "
                          "replaying the song's own transcribed drum groove")
     ap.add_argument("--model", default="mdx_q")
+    ap.add_argument("--threads", type=int, default=6,
+                    help="CPU threads for separation (VPS has 8 cores)")
     ap.add_argument("--single-submodel", action="store_true", default=True)
     ap.add_argument("--no-single-submodel", dest="single_submodel",
                     action="store_false")
@@ -1236,7 +1238,7 @@ def main() -> None:
         from models import load_stems_separator
         separate, info = load_stems_separator(
             args.model, stems=("vocals", "drums"),
-            num_threads=2, single_submodel=args.single_submodel)
+            num_threads=args.threads, single_submodel=args.single_submodel)
         mix = load_stereo(mix_path, sr)
         stems = separate_long_stems(separate, mix, sr)
         vocals = stems["vocals"].astype(np.float32)
