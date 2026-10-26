@@ -6,6 +6,9 @@ librosa
 
 # Source separation (Demucs-compatible)
 torch
+demucs
+demucs-infer
+diffq
 
 # Link input
 yt-dlp
