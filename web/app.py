@@ -132,6 +132,7 @@ def _run_job(job_id: str, user_id: str, url: str | None,
     job_dir.mkdir(exist_ok=True)
     out = job_dir / "output.wav"
     cmd = [PY, str(ENGINE), "--out", str(out),
+           "--model", "htdemucs_ft",
            "--perc-db", "13", "--backing", "haas-vocal",
            "--kit", "duff", "--groove", "lifted",
            "--no-single-submodel",
