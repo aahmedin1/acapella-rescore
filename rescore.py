@@ -1216,11 +1216,16 @@ def main() -> None:
     mix_path = args.mix
     if args.url:
         # the product's link-in flow: fetch the song, then treat it as --mix
-        import subprocess, tempfile, os
+        import subprocess, tempfile, os, sys
         print(f"downloading {args.url} ...", flush=True)
         tmpd = tempfile.mkdtemp(prefix="acapella-url-")
         mix_path = os.path.join(tmpd, "song.mp3")
-        subprocess.run(["yt-dlp", args.url, "--no-check-certificate",
+        # Use the same interpreter's yt-dlp module (bare `yt-dlp` is not
+        # guaranteed on PATH inside a venv), and the android player client,
+        # which YouTube's bot check usually lets through on datacenter IPs.
+        subprocess.run([sys.executable, "-m", "yt_dlp", args.url,
+                        "--no-check-certificate",
+                        "--extractor-args", "youtube:player_client=android",
                         "--retries", "5", "-x", "--audio-format", "mp3",
                         "-o", mix_path], check=True)
         print(f"  saved to {mix_path}", flush=True)
