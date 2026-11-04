@@ -201,6 +201,145 @@ def load_drum_sample(path: str, sr: int = 44100) -> np.ndarray:
     return y
 
 
+# Authentic Arabic iqa'at (rhythmic modes). Each has a distinct melodic
+# character -- the "maqam" of rhythm. Patterns are 8th-note positions
+# within a 4-beat bar: (pos, sound, velocity).
+# DUM = deep bass, tak = high edge, _ = rest.
+IQAAT = {
+    # Baladi (4/4): the classic -- DUM DUM tak DUM tak tak
+    # Warm, grounded, the "country" groove.
+    "baladi": [
+        (0.0, "dum", 1.0), (1.0, "dum", 0.85),
+        (3.0, "tak", 0.7), (4.0, "dum", 0.9),
+        (6.0, "tak", 0.65), (7.0, "tak", 0.75),
+    ],
+    # Maqsum (4/4): the wedding groove -- DUM tak tak DUM tak tak
+    # Driving, celebratory.
+    "maqsum": [
+        (0.0, "dum", 1.0), (1.0, "tak", 0.7), (2.0, "tak", 0.6),
+        (3.0, "tak", 0.7), (4.0, "dum", 0.9),
+        (6.0, "tak", 0.65), (7.0, "tak", 0.75),
+    ],
+    # Saidi (4/4): Upper Egypt -- DUM tak DUM DUM tak
+    # Heavy, proud, with the double-dum answer.
+    "saidi": [
+        (0.0, "dum", 1.0), (1.0, "tak", 0.65),
+        (4.0, "dum", 0.9), (5.0, "dum", 0.85),
+        (7.0, "tak", 0.7),
+    ],
+    # Wahda (4/4): slow classical -- DUM tak tak tak
+    # Spacious, elegant.
+    "wahda": [
+        (0.0, "dum", 1.0),
+        (2.0, "tak", 0.6), (3.0, "tak", 0.65),
+        (5.0, "tak", 0.6), (6.0, "tak", 0.65), (7.0, "tak", 0.7),
+    ],
+}
+
+
+def place_iqa_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
+                     insan_bar: float, iqa_name: str,
+                     vtimes: np.ndarray, vint: np.ndarray,
+                     use_samples: bool = False, sample_dir: str = None,
+                     real_dum: bool = False, add_riq: bool = True,
+                     is_chorus: np.ndarray = None) -> dict:
+    """Play an authentic Arabic iqa' (rhythmic mode) with musical phrasing.
+    Unlike a looped pattern, this builds 4-bar phrases: bars 1-3 establish
+    the iqa', bar 4 answers with a variation. Dynamics follow a phrase arc
+    (breathe in, build, release) -- like a player, not a drum machine.
+    The iqa' IS the melody of the rhythm; it has maqam (character)."""
+    import os
+    n_bars = len(bar_starts)
+    if is_chorus is None or len(is_chorus) != n_bars:
+        is_chorus = np.array([
+            float(np.interp(float(bs), vtimes, vint)) > 0.5
+            for bs in bar_starts], dtype=bool)
+
+    # kit: hybrid (synth dum + real tek) by default
+    if use_samples and sample_dir:
+        dum_bank = [load_drum_sample(os.path.join(sample_dir, f), sr)
+                    for f in ("dum1.wav", "dum2.wav")] if real_dum else []
+        tek_samp = load_drum_sample(os.path.join(sample_dir, "tek.wav"), sr)
+        dum = dum_bank[0] if dum_bank else duff_hit(sr)
+        tak_bank = [tek_samp]
+    else:
+        dum = duff_hit(sr)
+        tak_bank = [clap_hit(sr, seed=s) for s in (71, 72, 73, 74)]
+    riq_bank = [riq_hit(sr, seed=s) for s in (91, 92, 93)] if add_riq else []
+
+    Ld = np.zeros(n_samples, dtype=np.float32)
+    Rd = np.zeros(n_samples, dtype=np.float32)
+    Lc = np.zeros(n_samples, dtype=np.float32)
+    Rc = np.zeros(n_samples, dtype=np.float32)
+    Lq = np.zeros(n_samples, dtype=np.float32)
+    Rq = np.zeros(n_samples, dtype=np.float32)
+
+    pattern = IQAAT.get(iqa_name, IQAAT["baladi"])
+    rng = np.random.default_rng(42)
+    eighth = insan_bar / 8.0  # 8th-note duration
+
+    for b, bs in enumerate(bar_starts):
+        bs = float(bs)
+        Ibar = float(np.interp(bs, vtimes, vint))
+        ch = bool(is_chorus[b]) if b < len(is_chorus) else Ibar > 0.5
+        # phrase position: 0,1,2 = establish, 3 = answer/variation
+        phrase_pos = b % 4
+        # phrase arc: breathe (0.85), build (0.95, 1.0), release (0.9)
+        arc = [0.85, 0.95, 1.0, 0.9][phrase_pos]
+        # chorus lifts the whole phrase
+        lift = 1.15 if ch else 1.0
+        # vocal intensity still shapes it (soft when singer is silent)
+        m = 0.35 if Ibar < 0.12 else (0.6 + 0.4 * Ibar)
+
+        for pos, sound, vel in pattern:
+            # bar 4 (answer): vary the pattern -- drop the last tak,
+            # add an extra dum on the "and" of 3 for a call-and-response
+            if phrase_pos == 3:
+                if pos == 7.0 and sound == "tak":
+                    continue  # drop it, creates space
+                if pos == 6.0 and sound == "tak":
+                    # replace with a soft dum -- the "answer"
+                    sound, vel = "dum", 0.7
+            t = bs + pos * eighth
+            if t < 0 or t * sr >= n_samples:
+                continue
+            jitter = int(rng.uniform(-0.003, 0.003) * sr)
+            gain = vel * arc * lift * m
+            if sound == "dum":
+                snd = (dum_bank[int(rng.integers(0, len(dum_bank)))]
+                       if dum_bank else dum)
+                _pan_add(Ld, Rd, snd, int(t * sr) + jitter, 0.0,
+                         gain * 1.15, n_samples)
+            else:
+                snd = tak_bank[int(rng.integers(0, len(tak_bank)))]
+                pan = 0.12 if int(pos) % 2 else -0.12
+                _pan_add(Lc, Rc, snd, int(t * sr) + jitter, pan,
+                         gain * 0.65, n_samples)
+
+        # riq: sparse shimmer, only in chorus, on the "and" of 2 and 4
+        if add_riq and riq_bank and ch:
+            for ob in (3.0, 7.0):  # and-of-2, and-of-4
+                t = bs + ob * eighth
+                if t < 0 or t * sr >= n_samples:
+                    continue
+                snd = riq_bank[int(rng.integers(0, len(riq_bank)))]
+                jitter = int(rng.uniform(-0.003, 0.003) * sr)
+                _pan_add(Lq, Rq, snd, int(t * sr) + jitter,
+                         0.18 if ob == 3.0 else -0.18,
+                         0.35 * arc * m, n_samples)
+
+    layers = {
+        "dum": np.stack([np.tanh(Ld * 1.2),
+                         np.tanh(Rd * 1.2)]).astype(np.float32),
+        "clap": np.stack([np.tanh(Lc * 1.2),
+                          np.tanh(Rc * 1.2)]).astype(np.float32),
+    }
+    if add_riq:
+        layers["riq"] = np.stack([np.tanh(Lq * 1.2),
+                                  np.tanh(Rq * 1.2)]).astype(np.float32)
+    return layers
+
+
 def section_energy(music_mono: np.ndarray, sr: int,
                    beats: np.ndarray):
     """Split the song into bars and label loud bars as chorus.
@@ -1430,12 +1569,19 @@ def main() -> None:
                          "(drum machine), duff (deep dum/tek frame drum, "
                          "no tsk)")
     ap.add_argument("--groove", default="sparse",
-                    choices=["sparse", "dense", "dum", "lifted"],
+                    choices=["sparse", "dense", "dum", "lifted", "iqa"],
                     help="duff kit only: sparse = nasheed frame-drum groove "
                          "(DUM on 1&3, tek on 2&4); dense = dum-dum-tak "
                          "wedding groove; dum = just DUM on every Nth beat "
                          "(see --dum-every); lifted = replay a transcribed "
-                         "reference groove (see --groove-file)")
+                         "reference groove (see --groove-file); iqa = "
+                         "authentic Arabic rhythmic mode (see --iqa)")
+    ap.add_argument("--iqa", default="baladi",
+                    choices=["baladi", "maqsum", "saidi", "wahda"],
+                    help="with --groove iqa: which Arabic rhythmic mode. "
+                         "baladi = classic warm 4/4; maqsum = driving wedding "
+                         "4/4; saidi = heavy Upper-Egypt 4/4; wahda = slow "
+                         "spacious 4/4")
     ap.add_argument("--groove-file", default="groove_ref.json",
                     help="with --groove lifted: JSON from extract_groove.py")
     ap.add_argument("--real-drums", action="store_true", default=False,
@@ -1584,7 +1730,25 @@ def main() -> None:
     hits = (_transcribe_drums(drum_mono, sr)
             if (drum_mono is not None and args.transcribe) else [])
     if args.kit == "duff":
-        if args.groove == "lifted" and drum_mono is not None:
+        if args.groove == "iqa":
+            # authentic Arabic rhythmic mode with musical phrasing --
+            # the iqa' has maqam (character), phrases breathe and answer
+            bar_starts = np.array([beats[i] for i in range(len(beats))
+                                   if (i + shift_eff) % 4 == 0])
+            insan_bar = 4 * 60.0 / tempo_bpm
+            vtimes, vint = _vocal_intensity_curve(librosa.to_mono(vocals),
+                                                  sr)
+            print(f"  playing iqa' {args.iqa} @ ~{tempo_bpm:.0f} BPM, "
+                  f"{len(bar_starts)} bars", flush=True)
+            perc_layers = place_iqa_groove(n_samples, sr, bar_starts,
+                                           insan_bar, args.iqa, vtimes, vint,
+                                           use_samples=args.real_drums,
+                                           sample_dir=args.sample_dir,
+                                           real_dum=args.real_dum,
+                                           add_riq=args.riq,
+                                           is_chorus=is_chorus)
+            groove_desc = f"iqa' {args.iqa}"
+        elif args.groove == "lifted" and drum_mono is not None:
             # replay the reference's transcribed groove (its phrases,
             # fills, dynamics) on the song's own beat grid -- the
             # comb-refined tempo and downbeat, bar-locked to the real
@@ -1659,7 +1823,7 @@ def main() -> None:
                           kit=args.kit, intensity=intensity)
         groove_desc = "grid pattern"
         perc_layers = None
-    if groove_desc == "lifted reference groove":
+    if groove_desc in ("lifted reference groove") or groove_desc.startswith("iqa'"):
         # product beat levels: DUMs (level 1, the deep duff bass stroke)
         # and claps (level 2) get independent loudness; --layers picks
         # which are in the mix ("none" = audio-only vocals, no beats)
@@ -1718,7 +1882,8 @@ def main() -> None:
     bus = simple_reverb(bus, sr, wet=args.wet)
 
     out = master_clean(vocals + bus, sr)
-    if args.cut_silence and groove_desc == "lifted reference groove":
+    if args.cut_silence and (groove_desc == "lifted reference groove"
+                               or groove_desc.startswith("iqa'")):
         # shorten long instrumental breaks instead of drum-filling them
         out = cut_long_silences(out, sr, vtimes, vint,
                                 min_len=args.silence_min,
