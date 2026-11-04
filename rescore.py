@@ -146,6 +146,61 @@ def bbox_hat(sr: int, gain: float = 1.0) -> np.ndarray:
     return (x / max(np.abs(x).max(), 1e-6) * gain).astype(np.float32)
 
 
+def riq_hit(sr: int, gain: float = 1.0, seed: int = 91) -> np.ndarray:
+    """Riq jingle: bright metallic shimmer of the tambourine's cymbals.
+    Multiple detuned high partials + noise burst, fast decay -- the
+    'ts-ts' that makes Arabic percussion feel alive. Seed varies it so
+    repeated hits don't sound robotic."""
+    from scipy import signal
+    n = int(0.22 * sr)
+    t = np.arange(n) / sr
+    rng = np.random.default_rng(seed)
+    # metallic partials (inharmonic, like real jingles)
+    x = np.zeros(n)
+    for f, a, dec in [(5230, 0.5, 55), (6590, 0.35, 65), (7840, 0.30, 70),
+                      (9320, 0.22, 80), (11080, 0.15, 90)]:
+        f = f * (1 + rng.uniform(-0.01, 0.01))  # slight detune
+        x = x + a * np.sin(2 * np.pi * f * t) * np.exp(-t * dec)
+    # noise burst for the strike
+    noise = rng.standard_normal(n) * np.exp(-t * 90.0) * 0.4
+    sos = signal.butter(4, [5000, 12000], btype="band", fs=sr, output="sos")
+    x = x + signal.sosfilt(sos, noise)
+    # soft skin thump underneath (very quiet)
+    x = x + 0.12 * np.sin(2 * np.pi * 220.0 * t) * np.exp(-t * 60.0)
+    return (x / max(np.abs(x).max(), 1e-6) * gain).astype(np.float32)
+
+
+def riq_shake(sr: int, gain: float = 1.0, seed: int = 92) -> np.ndarray:
+    """Riq shake: a quick rattle of jingles (for fills and accents)."""
+    from scipy import signal
+    n = int(0.35 * sr)
+    t = np.arange(n) / sr
+    rng = np.random.default_rng(seed)
+    x = np.zeros(n)
+    # 5 quick jingle bursts, accelerating slightly
+    for k in range(5):
+        start = int((k * 0.055 - k * k * 0.002) * sr)
+        m = min(int(0.08 * sr), n - start)
+        if m <= 0:
+            continue
+        burst = rng.standard_normal(m) * np.exp(-np.arange(m) / (0.015 * sr))
+        sos = signal.butter(4, [5500, 11000], btype="band", fs=sr,
+                            output="sos")
+        x[start:start + m] += signal.sosfilt(sos, burst) * (0.5 + 0.1 * k)
+    return (x / max(np.abs(x).max(), 1e-6) * gain).astype(np.float32)
+
+
+def load_drum_sample(path: str, sr: int = 44100) -> np.ndarray:
+    """Load a real drum one-shot sample, mono, normalized."""
+    import librosa
+    y, _ = librosa.load(path, sr=sr, mono=True)
+    y = y.astype(np.float32)
+    peak = np.abs(y).max()
+    if peak > 1e-6:
+        y = y / peak
+    return y
+
+
 def section_energy(music_mono: np.ndarray, sr: int,
                    beats: np.ndarray):
     """Split the song into bars and label loud bars as chorus.
@@ -658,7 +713,10 @@ def place_dum_dum_tak_locked(n_samples: int, sr: int, pulses: np.ndarray,
 def place_lifted_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
                        insan_bar: float, gdata: dict,
                        vtimes: np.ndarray, vint: np.ndarray,
-                       hits: list) -> dict:
+                       hits: list, use_samples: bool = False,
+                       sample_dir: str = None, add_riq: bool = True,
+                       add_fills: bool = True,
+                       is_chorus: np.ndarray = None) -> dict:
     """Replay a transcribed reference groove (see extract_groove.py).
     The reference's hit pattern -- its phrases, variations, fills, the
     beat melody -- is mapped bar-for-bar onto this song's bar grid, so
@@ -667,23 +725,47 @@ def place_lifted_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
     so accents can't land off-beat. Verse / chorus loops switch with
     the vocal intensity; the groove keeps playing softly even when the
     singer is silent. Returns a dict of dry stereo layers:
-    {"dum": deep bass strokes, "clap": claps/snaps}. Reverb is applied
-    to the full backing bus in main(). Layers let the product offer
-    DUMs and claps as separately-priced/controllable beat levels."""
+    {"dum": deep bass strokes, "clap": claps/snaps, "riq": jingles}.
+    Reverb is applied to the full backing bus in main(). Layers let
+    the product offer DUMs and claps as separately-priced/controllable
+    beat levels."""
+    import os
     L = np.zeros(n_samples, dtype=np.float32)
     R = np.zeros(n_samples, dtype=np.float32)
-    dum = duff_hit(sr)
-    # claps instead of wood knocks (the Titanium v2 recipe):
-    # a small bank so no two hits sound identical
-    tak_bank = [clap_hit(sr, seed=s) for s in (71, 72, 73, 74)]
-    ka = tek_hit(sr, gain=0.35)
+    # align the per-bar chorus labels with our bar grid; if the
+    # section detector's bar count doesn't match, derive it from the
+    # vocal intensity curve at each bar start instead
+    n_bars = len(bar_starts)
+    if is_chorus is None or len(is_chorus) != n_bars:
+        is_chorus = np.array([
+            float(np.interp(float(bs), vtimes, vint)) > 0.5
+            for bs in bar_starts], dtype=bool)
+    if use_samples and sample_dir:
+        # real recorded drum hits (Freesound, CC-licensed)
+        dum_bank = [load_drum_sample(os.path.join(sample_dir, f), sr)
+                    for f in ("dum1.wav", "dum2.wav")]
+        tek_samp = load_drum_sample(os.path.join(sample_dir, "tek.wav"), sr)
+        dum = dum_bank[0]
+        tak_bank = [tek_samp]
+        ka = tek_samp
+    else:
+        dum = duff_hit(sr)
+        # claps instead of wood knocks (the Titanium v2 recipe):
+        # a small bank so no two hits sound identical
+        tak_bank = [clap_hit(sr, seed=s) for s in (71, 72, 73, 74)]
+        ka = tek_hit(sr, gain=0.35)
+    # riq jingles: the shimmer that makes Arabic percussion feel alive
+    riq_bank = [riq_hit(sr, seed=s) for s in (91, 92, 93)] if add_riq else []
+    riq_shk = riq_shake(sr) if add_riq else None
     sounds = {"dum": (dum, 1.15, 0.0), "tak": (None, 0.65, None),
-              "shk": (ka, 0.8, None)}
+              "shk": (ka, 0.8, None), "riq": (None, 0.5, None)}
     # separate accumulators per beat layer (the product's level 1/2)
     Ld = np.zeros(n_samples, dtype=np.float32)
     Rd = np.zeros(n_samples, dtype=np.float32)
     Lc = np.zeros(n_samples, dtype=np.float32)
     Rc = np.zeros(n_samples, dtype=np.float32)
+    Lq = np.zeros(n_samples, dtype=np.float32)
+    Rq = np.zeros(n_samples, dtype=np.float32)
     n_loop = int(gdata["loop_bars"])
     loops = {}
     for name in ("verse", "chorus"):
@@ -758,6 +840,11 @@ def place_lifted_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
             if c == "tak":
                 # a different knock each time, like a real hand
                 snd = tak_bank[int(rng.integers(0, len(tak_bank)))]
+            elif c == "dum" and use_samples and len(dum_bank) > 1:
+                # alternate real dum recordings so it breathes
+                snd = dum_bank[int(rng.integers(0, len(dum_bank)))]
+            elif c == "riq":
+                snd = riq_bank[int(rng.integers(0, len(riq_bank)))]
             if pan0 is None:
                 tak_alt += 1
                 pan0 = 0.15 if tak_alt % 2 else -0.15
@@ -767,15 +854,71 @@ def place_lifted_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
             if c == "dum":
                 _pan_add(Ld, Rd, snd, int(t * sr) + jitter, pan0,
                          v * g0 * m, n_samples)
+            elif c == "riq":
+                _pan_add(Lq, Rq, snd, int(t * sr) + jitter, pan0,
+                         v * g0 * m, n_samples)
             else:
                 _pan_add(Lc, Rc, snd, int(t * sr) + jitter, pan0,
                          v * g0 * m, n_samples)
+        # riq on the offbeats: the shimmer between the main hits.
+        # Chorus gets it on every offbeat; verse only on 2 and 4.
+        if add_riq and riq_bank:
+            beat_len = insan_bar / 4.0
+            is_ch = (is_chorus[b] if is_chorus is not None
+                     and b < len(is_chorus) else Ibar > 0.5)
+            offbeats = ([0.5, 1.5, 2.5, 3.5] if is_ch else [1.5, 3.5])
+            for ob in offbeats:
+                t = bs + ob * beat_len + best_dt
+                if t < 0 or t * sr >= n_samples:
+                    continue
+                snd = riq_bank[int(rng.integers(0, len(riq_bank)))]
+                I = float(np.interp(t, vtimes, vint))
+                m = 0.3 if I < 0.12 else (0.5 + 0.5 * I)
+                jitter = int(rng.uniform(-0.004, 0.004) * sr)
+                pan = 0.2 if int(ob * 2) % 2 else -0.2
+                _pan_add(Lq, Rq, snd, int(t * sr) + jitter, pan,
+                         0.5 * m, n_samples)
+        # fills: when the next bar starts a new section (verse->chorus
+        # or chorus->verse), play a fill in the last beat of this bar --
+        # a little roll that lands on the downbeat. This is what makes
+        # the arrangement feel alive instead of looped.
+        if add_fills and is_chorus is not None and b + 1 < len(is_chorus):
+            cur_ch = bool(is_chorus[b])
+            nxt_ch = bool(is_chorus[b + 1])
+            if cur_ch != nxt_ch and b + 1 < len(bar_starts):
+                beat_len = insan_bar / 4.0
+                fill_start = bs + 3.0 * beat_len  # last beat of the bar
+                # roll: 8th-note dum-tek building to the downbeat
+                for k, (kind, vel) in enumerate(
+                        [("tek", 0.5), ("dum", 0.6), ("tek", 0.7),
+                         ("tek", 0.8), ("dum", 1.0)]):
+                    t = fill_start + k * (beat_len / 2.5)
+                    if t < 0 or t * sr >= n_samples:
+                        continue
+                    if kind == "dum":
+                        s = (dum_bank[int(rng.integers(0, len(dum_bank)))]
+                             if use_samples else dum)
+                        _pan_add(Ld, Rd, s, int(t * sr), 0.0,
+                                 vel * 1.15, n_samples)
+                    else:
+                        s = tak_bank[int(rng.integers(0, len(tak_bank)))]
+                        _pan_add(Lc, Rc, s, int(t * sr), 0.0,
+                                 vel * 0.65, n_samples)
+                # riq shake over the fill if we have it
+                if add_riq and riq_shk is not None:
+                    t = fill_start
+                    if 0 <= t * sr < n_samples:
+                        _pan_add(Lq, Rq, riq_shk, int(t * sr), 0.0,
+                                 0.6, n_samples)
     layers = {
         "dum": np.stack([np.tanh(Ld * 1.2),
                          np.tanh(Rd * 1.2)]).astype(np.float32),
         "clap": np.stack([np.tanh(Lc * 1.2),
                           np.tanh(Rc * 1.2)]).astype(np.float32),
     }
+    if add_riq:
+        layers["riq"] = np.stack([np.tanh(Lq * 1.2),
+                                  np.tanh(Rq * 1.2)]).astype(np.float32)
     return layers
 
 
@@ -1112,6 +1255,70 @@ def spectral_gate(x: np.ndarray, sr: int, alpha: float = 3.0,
     return out
 
 
+def cut_long_silences(out: np.ndarray, sr: int, vtimes: np.ndarray,
+                      vint: np.ndarray, min_len: float = 8.0,
+                      keep_len: float = 3.0) -> np.ndarray:
+    """Shorten long vocal-silence stretches (instrumental breaks) instead
+    of filling them with drums. Regions where the vocal intensity stays
+    below the 'silent' threshold for longer than min_len seconds are cut
+    down to keep_len seconds (kept from the region's start, so the
+    transition out of the singing feels natural). Joins use short
+    crossfades. Returns the shortened stereo mix."""
+    thresh = 0.12  # same 'silent' threshold the groove uses
+    dur = out.shape[1] / sr
+    # sample the intensity curve at 10 Hz
+    ts = np.arange(0, dur, 0.1)
+    iv = np.interp(ts, vtimes, vint)
+    silent = iv < thresh
+    # find contiguous silent runs
+    regions = []
+    i = 0
+    while i < len(ts):
+        if silent[i]:
+            j = i
+            while j < len(ts) and silent[j]:
+                j += 1
+            s, e = ts[i], ts[min(j, len(ts) - 1)]
+            # don't cut leading/trailing silence (intro/outro fade is fine)
+            if s > 1.0 and e < dur - 1.0 and (e - s) >= min_len:
+                regions.append((s, min(s + keep_len, e)))
+            i = j
+        else:
+            i += 1
+    if not regions:
+        return out
+    # build the kept segments: [0, s1], [s1, s1+keep], [e1, s2], ...
+    segs = []
+    prev = 0.0
+    for s, k in regions:
+        if s > prev:
+            segs.append((prev, s))
+        segs.append((s, k))
+        prev = k
+    if prev < dur:
+        segs.append((prev, dur))
+    # concatenate with 0.25s crossfades
+    xf = int(0.25 * sr)
+    parts = []
+    for s, e in segs:
+        s0, e0 = int(s * sr), int(e * sr)
+        parts.append(out[:, s0:e0])
+    mixed = parts[0]
+    for p in parts[1:]:
+        n = min(xf, len(mixed[0]), len(p[0]))
+        if n > 0:
+            fade_out = np.linspace(1, 0, n, dtype=np.float32)
+            fade_in = np.linspace(0, 1, n, dtype=np.float32)
+            tail = mixed[:, -n:] * fade_out + p[:, :n] * fade_in
+            mixed = np.concatenate([mixed[:, :-n], tail, p[:, n:]], axis=1)
+        else:
+            mixed = np.concatenate([mixed, p], axis=1)
+    total_cut = dur - mixed.shape[1] / sr
+    print(f"  cut {len(regions)} long silent stretch(es), "
+          f"shortened {total_cut:.1f}s total", flush=True)
+    return mixed.astype(np.float32)
+
+
 def silence_gate(x: np.ndarray, sr: int, thresh_db: float = -40.0,
                  floor_db: float = -35.0, frame_ms: float = 20.0,
                  smooth_ms: float = 120.0) -> np.ndarray:
@@ -1192,6 +1399,27 @@ def main() -> None:
                          "reference groove (see --groove-file)")
     ap.add_argument("--groove-file", default="groove_ref.json",
                     help="with --groove lifted: JSON from extract_groove.py")
+    ap.add_argument("--real-drums", action="store_true", default=False,
+                    help="with --groove lifted: use real recorded dum/tek "
+                         "samples instead of synthesized hits")
+    ap.add_argument("--sample-dir", default="samples",
+                    help="with --real-drums: folder with dum1.wav, dum2.wav, "
+                         "tek.wav")
+    ap.add_argument("--no-riq", dest="riq", action="store_false",
+                    default=True,
+                    help="disable the riq jingle layer")
+    ap.add_argument("--no-fills", dest="fills", action="store_false",
+                    default=True,
+                    help="disable arrangement fills at section boundaries")
+    ap.add_argument("--no-cut-silence", dest="cut_silence",
+                    action="store_false", default=True,
+                    help="disable shortening of long instrumental breaks")
+    ap.add_argument("--silence-min", type=float, default=8.0,
+                    help="with --cut-silence: breaks longer than this "
+                         "(seconds) get shortened")
+    ap.add_argument("--silence-keep", type=float, default=3.0,
+                    help="with --cut-silence: shortened breaks keep this "
+                         "many seconds")
     ap.add_argument("--dum-every", type=int, default=1,
                     help="with --groove dum: DUM every N beats (2 = wider, "
                          "slower pulse)")
@@ -1331,7 +1559,12 @@ def main() -> None:
                   flush=True)
             perc_layers = place_lifted_groove(n_samples, sr, bar_starts,
                                               insan_bar, gdata, vtimes,
-                                              vint, hits)
+                                              vint, hits,
+                                              use_samples=args.real_drums,
+                                              sample_dir=args.sample_dir,
+                                              add_riq=args.riq,
+                                              add_fills=args.fills,
+                                              is_chorus=is_chorus)
             groove_desc = "lifted reference groove"
         elif len(hits) >= 20 and args.groove in ("dense", "dum"):
             # duff groove at the voice's own tempo, each bar re-locked to
@@ -1398,6 +1631,9 @@ def main() -> None:
             parts.append(perc_layers["clap"] * clap_g)
             print(f"  beat level 2: claps @ {args.perc_db + args.clap_db:+.0f} dB",
                   flush=True)
+        if "clap" in want and "riq" in perc_layers:
+            parts.append(perc_layers["riq"] * clap_g * 0.8)
+            print(f"  beat level 2: riq jingles", flush=True)
         if not parts:
             print("  audio-only: no beat layers", flush=True)
         perc = (sum(parts) if parts
@@ -1438,6 +1674,12 @@ def main() -> None:
     bus = simple_reverb(bus, sr, wet=args.wet)
 
     out = np.tanh(vocals + bus).astype(np.float32)
+    if args.cut_silence and groove_desc == "lifted reference groove":
+        # shorten long instrumental breaks instead of drum-filling them
+        out = cut_long_silences(out, sr, vtimes, vint,
+                                min_len=args.silence_min,
+                                keep_len=args.silence_keep)
+        n_samples = out.shape[1]
     sf.write(args.out, out.T, sr)
     peak = float(np.abs(out).max())
     print(f"wrote {args.out} ({n_samples / sr:.1f}s, peak {peak:.2f})",
