@@ -15,6 +15,7 @@ Needs: librosa (pip install librosa)
 
 import argparse
 import numpy as np
+import os
 import soundfile as sf
 
 
@@ -1644,6 +1645,8 @@ def main() -> None:
     ap.add_argument("--model", default="mdx_q")
     ap.add_argument("--threads", type=int, default=6,
                     help="CPU threads for separation (VPS has 8 cores)")
+    ap.add_argument("--no-stem-cache", action="store_true", default=False,
+                    help="ignore cached separated stems and re-run Demucs")
     ap.add_argument("--single-submodel", action="store_true", default=True)
     ap.add_argument("--no-single-submodel", dest="single_submodel",
                     action="store_false")
@@ -1671,13 +1674,40 @@ def main() -> None:
     if mix_path:
         print("separating dialogue/music ...", flush=True)
         from models import load_stems_separator
-        separate, info = load_stems_separator(
-            args.model, stems=("vocals", "drums"),
-            num_threads=args.threads, single_submodel=args.single_submodel)
-        mix = load_stereo(mix_path, sr)
-        stems = separate_long_stems(separate, mix, sr)
-        vocals = stems["vocals"].astype(np.float32)
-        drums = stems["drums"].astype(np.float32)
+        # cache separated stems by input file hash + model, so re-renders
+        # with different groove/kit settings skip the expensive separation
+        import hashlib
+        h = hashlib.md5()
+        with open(mix_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        cache_key = f"{h.hexdigest()}_{args.model}"
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 ".stem_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        voc_path = os.path.join(cache_dir, f"{cache_key}_vocals.wav")
+        drm_path = os.path.join(cache_dir, f"{cache_key}_drums.wav")
+        if (os.path.exists(voc_path) and os.path.exists(drm_path)
+                and not args.no_stem_cache):
+            print(f"  loading cached stems ({cache_key[:8]}...)", flush=True)
+            vocals = load_stereo(voc_path, sr)
+            drums = load_stereo(drm_path, sr)
+            mix = load_stereo(mix_path, sr)
+            n = min(vocals.shape[1], drums.shape[1], mix.shape[1])
+            vocals, drums, mix = vocals[:, :n], drums[:, :n], mix[:, :n]
+        else:
+            separate, info = load_stems_separator(
+                args.model, stems=("vocals", "drums"),
+                num_threads=args.threads,
+                single_submodel=args.single_submodel)
+            mix = load_stereo(mix_path, sr)
+            stems = separate_long_stems(separate, mix, sr)
+            vocals = stems["vocals"].astype(np.float32)
+            drums = stems["drums"].astype(np.float32)
+            # save to cache
+            sf.write(voc_path, vocals.T, sr)
+            sf.write(drm_path, drums.T, sr)
+            print(f"  cached stems ({cache_key[:8]}...)", flush=True)
         music = (mix - vocals).astype(np.float32)
     else:
         vocals = load_stereo(args.vocals, sr)
