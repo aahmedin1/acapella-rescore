@@ -1260,6 +1260,38 @@ def spectral_gate(x: np.ndarray, sr: int, alpha: float = 3.0,
     return out
 
 
+def master_clean(mix: np.ndarray, sr: int) -> np.ndarray:
+    """Mastering for a 'clean' sound: warm EQ (tame the harsh highs),
+    gentle dynamics (not squashed). Targets the reference's character:
+    warm (~2200 Hz centroid), controlled highs, dynamic (~15 dB crest)."""
+    from scipy import signal
+    out = mix.copy()
+    # 1. Tame harsh highs: gentle lowpass at 7kHz (12dB/oct)
+    # Our renders measure ~2x the reference's high-frequency energy.
+    sos = signal.butter(2, 7000, btype="low", fs=sr, output="sos")
+    # Blend: 70% filtered + 30% original (keeps some air, removes harshness)
+    for ch in range(out.shape[0]):
+        filtered = signal.sosfilt(sos, out[ch])
+        out[ch] = 0.7 * filtered + 0.3 * out[ch]
+    # 2. Gentle warmth: slight boost around 200-400 Hz (body)
+    sos2 = signal.butter(1, [150, 500], btype="band", fs=sr, output="sos")
+    for ch in range(out.shape[0]):
+        body = signal.sosfilt(sos2, out[ch])
+        out[ch] = out[ch] + 0.15 * body
+    # 3. Soft limiter instead of hard tanh: more dynamic, less squashed.
+    # Scale to -3dB headroom, then soft-clip only the peaks.
+    peak = np.abs(out).max()
+    if peak > 1e-6:
+        out = out / peak * 0.89  # -1dB headroom
+    # soft knee: linear below 0.7, gentle curve above
+    thr = 0.7
+    over = np.abs(out) > thr
+    out[over] = np.sign(out[over]) * (
+        thr + (np.abs(out[over]) - thr) / (1 + ((np.abs(out[over]) - thr) / 0.3) ** 2) ** 0.5 * 0.3
+    )
+    return out.astype(np.float32)
+
+
 def cut_long_silences(out: np.ndarray, sr: int, vtimes: np.ndarray,
                       vint: np.ndarray, min_len: float = 8.0,
                       keep_len: float = 3.0) -> np.ndarray:
@@ -1685,7 +1717,7 @@ def main() -> None:
         print(f"  {n_risers} riser(s) into the chorus", flush=True)
     bus = simple_reverb(bus, sr, wet=args.wet)
 
-    out = np.tanh(vocals + bus).astype(np.float32)
+    out = master_clean(vocals + bus, sr)
     if args.cut_silence and groove_desc == "lifted reference groove":
         # shorten long instrumental breaks instead of drum-filling them
         out = cut_long_silences(out, sr, vtimes, vint,
