@@ -1433,12 +1433,15 @@ def master_clean(mix: np.ndarray, sr: int) -> np.ndarray:
 
 def cut_long_silences(out: np.ndarray, sr: int, vtimes: np.ndarray,
                       vint: np.ndarray, min_len: float = 8.0,
-                      keep_len: float = 3.0) -> np.ndarray:
+                      keep_len: float = 3.0,
+                      bar_starts: np.ndarray = None) -> np.ndarray:
     """Shorten long vocal-silence stretches (instrumental breaks) instead
     of filling them with drums. Regions where the vocal intensity stays
     below the 'silent' threshold for longer than min_len seconds are cut
     down to keep_len seconds (kept from the region's start, so the
-    transition out of the singing feels natural). Joins use short
+    transition out of the singing feels natural). Cuts snap to bar
+    boundaries (if bar_starts is given) so the groove stays in sync --
+    cutting mid-bar makes the beat feel unsynced. Joins use short
     crossfades. Returns the shortened stereo mix."""
     thresh = 0.12  # same 'silent' threshold the groove uses
     dur = out.shape[1] / sr
@@ -1446,6 +1449,14 @@ def cut_long_silences(out: np.ndarray, sr: int, vtimes: np.ndarray,
     ts = np.arange(0, dur, 0.1)
     iv = np.interp(ts, vtimes, vint)
     silent = iv < thresh
+
+    def snap_to_bar(t: float) -> float:
+        """Snap a cut point to the nearest bar start."""
+        if bar_starts is None or len(bar_starts) == 0:
+            return t
+        idx = int(np.argmin(np.abs(bar_starts - t)))
+        return float(bar_starts[idx])
+
     # find contiguous silent runs
     regions = []
     i = 0
@@ -1458,7 +1469,14 @@ def cut_long_silences(out: np.ndarray, sr: int, vtimes: np.ndarray,
             # don't cut trailing silence (outro fade is fine), but DO cut
             # leading silence -- long instrumental intros get shortened too
             if e < dur - 1.0 and (e - s) >= min_len:
-                regions.append((s, min(s + keep_len, e), e))
+                # snap cut points to bar boundaries for sync
+                s_snap = snap_to_bar(s)
+                k_snap = snap_to_bar(min(s + keep_len, e))
+                # only keep the cut if snapping didn't collapse it
+                if k_snap > s_snap:
+                    regions.append((s_snap, k_snap, snap_to_bar(e)))
+                else:
+                    regions.append((s, min(s + keep_len, e), e))
             i = j
         else:
             i += 1
@@ -1884,10 +1902,12 @@ def main() -> None:
     out = master_clean(vocals + bus, sr)
     if args.cut_silence and (groove_desc == "lifted reference groove"
                                or groove_desc.startswith("iqa'")):
-        # shorten long instrumental breaks instead of drum-filling them
+        # shorten long instrumental breaks instead of drum-filling them;
+        # cuts snap to bar boundaries so the groove stays in sync
         out = cut_long_silences(out, sr, vtimes, vint,
                                 min_len=args.silence_min,
-                                keep_len=args.silence_keep)
+                                keep_len=args.silence_keep,
+                                bar_starts=bar_starts)
         n_samples = out.shape[1]
     sf.write(args.out, out.T, sr)
     peak = float(np.abs(out).max())
