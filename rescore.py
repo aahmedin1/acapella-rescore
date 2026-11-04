@@ -714,8 +714,8 @@ def place_lifted_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
                        insan_bar: float, gdata: dict,
                        vtimes: np.ndarray, vint: np.ndarray,
                        hits: list, use_samples: bool = False,
-                       sample_dir: str = None, add_riq: bool = True,
-                       add_fills: bool = True,
+                       sample_dir: str = None, real_dum: bool = False,
+                       add_riq: bool = True, add_fills: bool = True,
                        is_chorus: np.ndarray = None) -> dict:
     """Replay a transcribed reference groove (see extract_groove.py).
     The reference's hit pattern -- its phrases, variations, fills, the
@@ -742,10 +742,14 @@ def place_lifted_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
             for bs in bar_starts], dtype=bool)
     if use_samples and sample_dir:
         # real recorded drum hits (Freesound, CC-licensed)
+        # the dum stays synthesized by default -- the real doumbek dum
+        # is very traditionally Middle Eastern; the synth dum is a
+        # cleaner, more neutral deep thump. Use --real-dum for the
+        # ethnic goblet-drum sound.
         dum_bank = [load_drum_sample(os.path.join(sample_dir, f), sr)
-                    for f in ("dum1.wav", "dum2.wav")]
+                    for f in ("dum1.wav", "dum2.wav")] if real_dum else []
         tek_samp = load_drum_sample(os.path.join(sample_dir, "tek.wav"), sr)
-        dum = dum_bank[0]
+        dum = dum_bank[0] if dum_bank else duff_hit(sr)
         tak_bank = [tek_samp]
         ka = tek_samp
     else:
@@ -897,7 +901,7 @@ def place_lifted_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
                         continue
                     if kind == "dum":
                         s = (dum_bank[int(rng.integers(0, len(dum_bank)))]
-                             if use_samples else dum)
+                             if dum_bank else dum)
                         _pan_add(Ld, Rd, s, int(t * sr), 0.0,
                                  vel * 1.15, n_samples)
                     else:
@@ -1281,20 +1285,21 @@ def cut_long_silences(out: np.ndarray, sr: int, vtimes: np.ndarray,
             s, e = ts[i], ts[min(j, len(ts) - 1)]
             # don't cut leading/trailing silence (intro/outro fade is fine)
             if s > 1.0 and e < dur - 1.0 and (e - s) >= min_len:
-                regions.append((s, min(s + keep_len, e)))
+                regions.append((s, min(s + keep_len, e), e))
             i = j
         else:
             i += 1
     if not regions:
         return out
     # build the kept segments: [0, s1], [s1, s1+keep], [e1, s2], ...
+    # (skip from the kept part's end to the region's end)
     segs = []
     prev = 0.0
-    for s, k in regions:
+    for s, k, e in regions:
         if s > prev:
             segs.append((prev, s))
         segs.append((s, k))
-        prev = k
+        prev = e  # jump over the cut part
     if prev < dur:
         segs.append((prev, dur))
     # concatenate with 0.25s crossfades
@@ -1405,6 +1410,10 @@ def main() -> None:
     ap.add_argument("--sample-dir", default="samples",
                     help="with --real-drums: folder with dum1.wav, dum2.wav, "
                          "tek.wav")
+    ap.add_argument("--real-dum", action="store_true", default=False,
+                    help="with --real-drums: use the real doumbek dum samples "
+                         "(very traditional Middle Eastern); default keeps "
+                         "the synthesized deep dum")
     ap.add_argument("--no-riq", dest="riq", action="store_false",
                     default=True,
                     help="disable the riq jingle layer")
@@ -1562,6 +1571,7 @@ def main() -> None:
                                               vint, hits,
                                               use_samples=args.real_drums,
                                               sample_dir=args.sample_dir,
+                                              real_dum=args.real_dum,
                                               add_riq=args.riq,
                                               add_fills=args.fills,
                                               is_chorus=is_chorus)
