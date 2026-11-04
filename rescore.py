@@ -865,12 +865,13 @@ def place_lifted_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
                 _pan_add(Lc, Rc, snd, int(t * sr) + jitter, pan0,
                          v * g0 * m, n_samples)
         # riq on the offbeats: the shimmer between the main hits.
-        # Chorus gets it on every offbeat; verse only on 2 and 4.
+        # Kept sparse -- chorus gets it on 2 offbeats, verse gets none.
+        # (Denser riq felt cluttered/unsynced at faster tempos.)
         if add_riq and riq_bank:
             beat_len = insan_bar / 4.0
             is_ch = (is_chorus[b] if is_chorus is not None
                      and b < len(is_chorus) else Ibar > 0.5)
-            offbeats = ([0.5, 1.5, 2.5, 3.5] if is_ch else [1.5, 3.5])
+            offbeats = [1.5, 3.5] if is_ch else []
             for ob in offbeats:
                 t = bs + ob * beat_len + best_dt
                 if t < 0 or t * sr >= n_samples:
@@ -881,7 +882,7 @@ def place_lifted_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
                 jitter = int(rng.uniform(-0.004, 0.004) * sr)
                 pan = 0.2 if int(ob * 2) % 2 else -0.2
                 _pan_add(Lq, Rq, snd, int(t * sr) + jitter, pan,
-                         0.5 * m, n_samples)
+                         0.35 * m, n_samples)
         # fills: when the next bar starts a new section (verse->chorus
         # or chorus->verse), play a fill in the last beat of this bar --
         # a little roll that lands on the downbeat. This is what makes
@@ -892,11 +893,11 @@ def place_lifted_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
             if cur_ch != nxt_ch and b + 1 < len(bar_starts):
                 beat_len = insan_bar / 4.0
                 fill_start = bs + 3.0 * beat_len  # last beat of the bar
-                # roll: 8th-note dum-tek building to the downbeat
+                # fill: 3 hits building to the downbeat (kept simple --
+                # denser fills felt cluttered at faster tempos)
                 for k, (kind, vel) in enumerate(
-                        [("tek", 0.5), ("dum", 0.6), ("tek", 0.7),
-                         ("tek", 0.8), ("dum", 1.0)]):
-                    t = fill_start + k * (beat_len / 2.5)
+                        [("tek", 0.6), ("tek", 0.8), ("dum", 1.0)]):
+                    t = fill_start + k * (beat_len / 1.5)
                     if t < 0 or t * sr >= n_samples:
                         continue
                     if kind == "dum":
@@ -1283,8 +1284,9 @@ def cut_long_silences(out: np.ndarray, sr: int, vtimes: np.ndarray,
             while j < len(ts) and silent[j]:
                 j += 1
             s, e = ts[i], ts[min(j, len(ts) - 1)]
-            # don't cut leading/trailing silence (intro/outro fade is fine)
-            if s > 1.0 and e < dur - 1.0 and (e - s) >= min_len:
+            # don't cut trailing silence (outro fade is fine), but DO cut
+            # leading silence -- long instrumental intros get shortened too
+            if e < dur - 1.0 and (e - s) >= min_len:
                 regions.append((s, min(s + keep_len, e), e))
             i = j
         else:
