@@ -11,6 +11,10 @@ venv/
 *.flac
 *.ogg
 !groove_ref.json
+# ...but DO commit the small drum/hum one-shot samples
+!samples/
+!samples/*.wav
+!samples/*.mp3
 
 # Temp / OS
 /tmp/
