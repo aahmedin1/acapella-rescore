@@ -202,17 +202,97 @@ def load_drum_sample(path: str, sr: int = 44100) -> np.ndarray:
     return y
 
 
+# Vocal pads (hums, "ahh", "ooh") -- synthesized vowel sounds for the
+# acapella backing. A vowel is a sawtooth through formant bandpass filters.
+VOWEL_FORMANTS = {
+    "ahh": [(730, 80), (1090, 90), (2440, 120)],   # open "a"
+    "ooh": [(300, 60), (870, 80), (2240, 120)],    # round "u"
+    "hmm": [(250, 50), (500, 60), (900, 80)],      # nasal hum
+}
+
+
+def vowel_pad(sr: int, dur: float, freq: float, vowel: str = "ahh",
+              gain: float = 0.3) -> np.ndarray:
+    """Synthesize a warm vowel pad (humming/ahh/ooh) at a given pitch.
+    Soft sine-based tone (not harsh sawtooth) through gentle formant
+    filters, slow attack/release, gentle vibrato -- like a warm nasheed
+    backing vocalist holding a note."""
+    from scipy.signal import butter, sosfilt
+    n = int(dur * sr)
+    t = np.arange(n) / sr
+    # vibrato: +/- 0.4% at 4.5 Hz (slower, warmer)
+    vib = 1.0 + 0.004 * np.sin(2 * np.pi * 4.5 * t)
+    # soft tone: fundamental dominant (deep, warm), just a whisper of
+    # 2nd harmonic -- like a bass singer humming, not a mosquito
+    phase = 2 * np.pi * np.cumsum(freq * vib) / sr
+    tone = np.sin(phase) + 0.15 * np.sin(2 * phase) + 0.03 * np.sin(3 * phase)
+    # gentle formant shaping (wide, soft -- not sharp bandpass peaks)
+    out = np.zeros(n, dtype=np.float32)
+    for f_center, bw in VOWEL_FORMANTS.get(vowel, VOWEL_FORMANTS["ahh"]):
+        # wider bandwidth = softer, warmer
+        sos = butter(1, [max(20, f_center - bw * 2), f_center + bw * 2],
+                     btype="bandpass", fs=sr, output="sos")
+        out += sosfilt(sos, tone) * 0.5
+    # blend the raw warm tone with the formant-shaped tone
+    out = 0.6 * tone + 0.4 * out
+    out = out / max(1e-6, np.abs(out).max())
+    # slow attack (0.5s) and release (1.0s) -- a singer breathing in/out
+    atk = min(int(0.5 * sr), n // 4)
+    rel = min(int(1.0 * sr), n // 3)
+    env = np.ones(n, dtype=np.float32)
+    env[:atk] = np.linspace(0, 1, atk) ** 2  # smooth ease-in
+    env[-rel:] = np.linspace(1, 0, rel) ** 2  # smooth ease-out
+    return (out * env * gain).astype(np.float32)
+
+
+def hum_solo(vocals_mono: np.ndarray, sr: int, gain: float = 0.5) -> np.ndarray:
+    """Turn the lead vocal into a warm human hum (like the Mishari backing).
+    Gentle lowpass keeps the voice natural and warm (removes sibilance
+    and breath, keeps the tone) -- it IS a real human voice humming the
+    melody, so it sounds natural, not synthetic."""
+    from scipy.signal import butter, sosfilt
+    # gentle lowpass at 1200 Hz -- keeps the voice warm and clear,
+    # removes harsh sibilance but not the human quality
+    sos = butter(2, 1200, btype="lowpass", fs=sr, output="sos")
+    hum = sosfilt(sos, vocals_mono.astype(np.float32))
+    # gentle compression to even out the dynamics
+    peak = np.abs(hum).max()
+    if peak > 1e-6:
+        hum = hum / peak
+        # soft-clip for warmth (not harsh)
+        hum = np.tanh(hum * 1.2) / np.tanh(1.2)
+    return (hum * gain).astype(np.float32)
+
+
+def detect_tonic(vocals_mono: np.ndarray, sr: int) -> float:
+    """Estimate the song's tonic (root pitch) from the vocal stem using
+    chroma -- the most common pitch class, mapped to a frequency in the
+    130-260 Hz range (a comfortable humming register)."""
+    import librosa
+    chroma = librosa.feature.chroma_cqt(y=vocals_mono, sr=sr)
+    pc = int(np.argmax(chroma.mean(axis=1)))
+    # pitch class 0 = C; C3 = 130.81 Hz
+    base = 130.81 * (2 ** (pc / 12.0))
+    while base < 130:
+        base *= 2
+    while base > 260:
+        base /= 2
+    return float(base)
+
+
 # Authentic Arabic iqa'at (rhythmic modes). Each has a distinct melodic
 # character -- the "maqam" of rhythm. Patterns are 8th-note positions
 # within a 4-beat bar: (pos, sound, velocity).
 # DUM = deep bass, tak = high edge, _ = rest.
 IQAAT = {
-    # Baladi (4/4): the classic -- DUM DUM tak DUM tak tak
-    # Warm, grounded, the "country" groove.
+    # Baladi (4/4): the classic -- DUM DUM tak DUM tak
+    # Warm, grounded, the "country" groove. Taks kept sparse (only on
+    # the offbeats that feel natural) -- dense taks land in awkward
+    # positions against the vocal.
     "baladi": [
         (0.0, "dum", 1.0), (1.0, "dum", 0.85),
         (3.0, "tak", 0.7), (4.0, "dum", 0.9),
-        (6.0, "tak", 0.65), (7.0, "tak", 0.75),
+        (7.0, "tak", 0.75),
     ],
     # Maqsum (4/4): the wedding groove -- DUM tak tak DUM tak tak
     # Driving, celebratory.
@@ -243,13 +323,18 @@ def place_iqa_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
                      vtimes: np.ndarray, vint: np.ndarray,
                      use_samples: bool = False, sample_dir: str = None,
                      real_dum: bool = False, add_riq: bool = True,
-                     is_chorus: np.ndarray = None) -> dict:
+                     is_chorus: np.ndarray = None,
+                     tempo_mult: float = 1.0, deluxe: bool = False,
+                     dum_for_tak: bool = False) -> dict:
     """Play an authentic Arabic iqa' (rhythmic mode) with musical phrasing.
     Unlike a looped pattern, this builds 4-bar phrases: bars 1-3 establish
     the iqa', bar 4 answers with a variation. Dynamics follow a phrase arc
     (breathe in, build, release) -- like a player, not a drum machine.
-    The iqa' IS the melody of the rhythm; it has maqam (character)."""
-    import os
+    The iqa' IS the melody of the rhythm; it has maqam (character).
+    tempo_mult: 2.0 if the beat tracker found half-time (e.g. 73 BPM when
+    the song feels like 146) -- plays the pattern at the faster pulse.
+    deluxe: richer arrangement -- more riq shimmer (verse + chorus),
+    fills at phrase boundaries, bigger dynamics."""
     n_bars = len(bar_starts)
     if is_chorus is None or len(is_chorus) != n_bars:
         is_chorus = np.array([
@@ -276,8 +361,22 @@ def place_iqa_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
     Rq = np.zeros(n_samples, dtype=np.float32)
 
     pattern = IQAAT.get(iqa_name, IQAAT["baladi"])
+    # dum_for_tak: replace high tak hits with deep DUMs (pop songs
+    # where the tak feels too baladi/folksy -- want it deeper)
+    if dum_for_tak:
+        pattern = [(pos, "dum" if s == "tak" else s, vel * 0.9)
+                   for pos, s, vel in pattern]
     rng = np.random.default_rng(42)
-    eighth = insan_bar / 8.0  # 8th-note duration
+    # tempo_mult: if the tracker found half-time, play the pattern at the
+    # faster pulse. The pattern fills the bar exactly: we scale the 8th-note
+    # duration so 8 8ths = bar / tempo_mult, then repeat to fill the bar.
+    # For non-integer mult, we use the fractional part to avoid overlap.
+    eighth = insan_bar / 8.0 / tempo_mult
+    # Number of full pattern repeats that fit in a bar without overlap
+    pattern_dur = 8 * eighth  # = insan_bar / tempo_mult
+    n_reps = int(insan_bar / pattern_dur)  # floor, avoids overlap
+    if n_reps < 1:
+        n_reps = 1
 
     for b, bs in enumerate(bar_starts):
         bs = float(bs)
@@ -292,42 +391,77 @@ def place_iqa_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
         # vocal intensity still shapes it (soft when singer is silent)
         m = 0.35 if Ibar < 0.12 else (0.6 + 0.4 * Ibar)
 
-        for pos, sound, vel in pattern:
-            # bar 4 (answer): vary the pattern -- drop the last tak,
-            # add an extra dum on the "and" of 3 for a call-and-response
-            if phrase_pos == 3:
-                if pos == 7.0 and sound == "tak":
-                    continue  # drop it, creates space
-                if pos == 6.0 and sound == "tak":
-                    # replace with a soft dum -- the "answer"
-                    sound, vel = "dum", 0.7
-            t = bs + pos * eighth
-            if t < 0 or t * sr >= n_samples:
-                continue
-            jitter = int(rng.uniform(-0.003, 0.003) * sr)
-            gain = vel * arc * lift * m
-            if sound == "dum":
-                snd = (dum_bank[int(rng.integers(0, len(dum_bank)))]
-                       if dum_bank else dum)
-                _pan_add(Ld, Rd, snd, int(t * sr) + jitter, 0.0,
-                         gain * 1.15, n_samples)
-            else:
-                snd = tak_bank[int(rng.integers(0, len(tak_bank)))]
-                pan = 0.12 if int(pos) % 2 else -0.12
-                _pan_add(Lc, Rc, snd, int(t * sr) + jitter, pan,
-                         gain * 0.65, n_samples)
-
-        # riq: sparse shimmer, only in chorus, on the "and" of 2 and 4
-        if add_riq and riq_bank and ch:
-            for ob in (3.0, 7.0):  # and-of-2, and-of-4
-                t = bs + ob * eighth
+        # repeat the pattern n_reps times per bar if tempo_mult > 1
+        # (e.g. 2x for half-time detection)
+        for rep in range(n_reps):
+            rep_offset = rep * (insan_bar / tempo_mult)
+            for pos, sound, vel in pattern:
+                # bar 4 (answer): vary the pattern -- drop the last tak,
+                # add an extra dum on the "and" of 3 for a call-and-response
+                # (only on the last rep, so the phrase still resolves)
+                if phrase_pos == 3 and rep == n_reps - 1:
+                    if pos == 7.0 and sound == "tak":
+                        continue  # drop it, creates space
+                    if pos == 6.0 and sound == "tak":
+                        # replace with a soft dum -- the "answer"
+                        sound, vel = "dum", 0.7
+                t = bs + rep_offset + pos * eighth
                 if t < 0 or t * sr >= n_samples:
                     continue
-                snd = riq_bank[int(rng.integers(0, len(riq_bank)))]
                 jitter = int(rng.uniform(-0.003, 0.003) * sr)
-                _pan_add(Lq, Rq, snd, int(t * sr) + jitter,
-                         0.18 if ob == 3.0 else -0.18,
-                         0.35 * arc * m, n_samples)
+                gain = vel * arc * lift * m
+                if sound == "dum":
+                    snd = (dum_bank[int(rng.integers(0, len(dum_bank)))]
+                           if dum_bank else dum)
+                    _pan_add(Ld, Rd, snd, int(t * sr) + jitter, 0.0,
+                             gain * 1.15, n_samples)
+                else:
+                    snd = tak_bank[int(rng.integers(0, len(tak_bank)))]
+                    pan = 0.12 if int(pos) % 2 else -0.12
+                    _pan_add(Lc, Rc, snd, int(t * sr) + jitter, pan,
+                             gain * 0.65, n_samples)
+
+        # riq: shimmer on the offbeats. Standard: chorus only, 2 offbeats.
+        # Deluxe: verse + chorus, 4 offbeats, brighter.
+        if add_riq and riq_bank:
+            if deluxe:
+                riq_beats = (1.0, 3.0, 5.0, 7.0)  # every offbeat
+                riq_gain = 0.5
+                riq_active = True  # verse and chorus
+            else:
+                riq_beats = (3.0, 7.0)  # and-of-2, and-of-4
+                riq_gain = 0.35
+                riq_active = ch
+            if riq_active:
+                for ob in riq_beats:
+                    t = bs + ob * eighth
+                    if t < 0 or t * sr >= n_samples:
+                        continue
+                    snd = riq_bank[int(rng.integers(0, len(riq_bank)))]
+                    jitter = int(rng.uniform(-0.003, 0.003) * sr)
+                    _pan_add(Lq, Rq, snd, int(t * sr) + jitter,
+                             0.18 if ob in (1.0, 3.0) else -0.18,
+                             riq_gain * arc * m, n_samples)
+
+        # fills: at the end of each 4-bar phrase (bar 4), a little flourish
+        # on the last beat -- deluxe only, so the base stays clean
+        if deluxe and phrase_pos == 3:
+            # 3-hit fill on the last beat: tak-tak-DUM
+            for fi, (foff, fsound, fvel) in enumerate([
+                    (6.0, "tak", 0.6), (6.5, "tak", 0.7),
+                    (7.0, "dum", 0.9)]):
+                t = bs + foff * eighth
+                if t < 0 or t * sr >= n_samples:
+                    continue
+                jitter = int(rng.uniform(-0.002, 0.002) * sr)
+                if fsound == "dum":
+                    snd = dum
+                    _pan_add(Ld, Rd, snd, int(t * sr) + jitter, 0.0,
+                             fvel * arc * lift * m * 1.15, n_samples)
+                else:
+                    snd = tak_bank[int(rng.integers(0, len(tak_bank)))]
+                    _pan_add(Lc, Rc, snd, int(t * sr) + jitter, 0.1,
+                             fvel * arc * lift * m * 0.65, n_samples)
 
     layers = {
         "dum": np.stack([np.tanh(Ld * 1.2),
@@ -856,7 +990,8 @@ def place_lifted_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
                        hits: list, use_samples: bool = False,
                        sample_dir: str = None, real_dum: bool = False,
                        add_riq: bool = True, add_fills: bool = True,
-                       is_chorus: np.ndarray = None) -> dict:
+                       is_chorus: np.ndarray = None,
+                       dum_for_tak: bool = False) -> dict:
     """Replay a transcribed reference groove (see extract_groove.py).
     The reference's hit pattern -- its phrases, variations, fills, the
     beat melody -- is mapped bar-for-bar onto this song's bar grid, so
@@ -868,8 +1003,8 @@ def place_lifted_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
     {"dum": deep bass strokes, "clap": claps/snaps, "riq": jingles}.
     Reverb is applied to the full backing bus in main(). Layers let
     the product offer DUMs and claps as separately-priced/controllable
-    beat levels."""
-    import os
+    beat levels. dum_for_tak: replace the high tak/tek hits with deep
+    DUMs -- for pop songs where the tak feels too baladi/folksy."""
     L = np.zeros(n_samples, dtype=np.float32)
     R = np.zeros(n_samples, dtype=np.float32)
     # align the per-bar chorus labels with our bar grid; if the
@@ -980,6 +1115,11 @@ def place_lifted_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
         for t, c, v in play:
             if t < 0 or t * sr >= n_samples:
                 continue
+            # dum_for_tak: replace high tak hits with deep DUMs
+            # (pop songs where the tak feels too baladi/folksy)
+            if dum_for_tak and c == "tak":
+                c = "dum"
+                v = v * 0.9  # slightly softer, it's a deep thump now
             snd, g0, pan0 = sounds.get(c, (tak_bank[0], 0.9, None))
             if c == "tak":
                 # a different knock each time, like a real hand
@@ -987,6 +1127,8 @@ def place_lifted_groove(n_samples: int, sr: int, bar_starts: np.ndarray,
             elif c == "dum" and use_samples and len(dum_bank) > 1:
                 # alternate real dum recordings so it breathes
                 snd = dum_bank[int(rng.integers(0, len(dum_bank)))]
+            elif c == "dum":
+                snd = dum
             elif c == "riq":
                 snd = riq_bank[int(rng.integers(0, len(riq_bank)))]
             if pan0 is None:
@@ -1250,11 +1392,15 @@ def _refine_tempo(src_mono: np.ndarray, sr: int, dur: float,
     return best_b, best_ph
 
 
-def _track_grid(src_mono: np.ndarray, sr: int, dur: float):
-    """Beat-track one source and fill a rigid tempo grid across the whole
+def _track_grid(src_mono: np.ndarray, sr: int, dur: float,
+                dynamic: bool = False):
+    """Beat-track one source and fill a tempo grid across the whole
     track. The DP tracker gives a tempo hint and micro-timing; a
     comb-filter search pins the exact tempo and phase. Returns
-    (beats, tempo_bpm, snap_err_ms). Raises SystemExit if nothing steady."""
+    (beats, tempo_bpm, snap_err_ms). Raises SystemExit if nothing steady.
+    dynamic=True: use the raw DP beats (which follow tempo changes)
+    instead of a rigid grid -- for songs with tempo shifts between
+    sections."""
     import librosa
     tempo, beats = librosa.beat.beat_track(y=src_mono, sr=sr, units="time")
     tempo = float(np.atleast_1d(tempo)[0])
@@ -1265,6 +1411,23 @@ def _track_grid(src_mono: np.ndarray, sr: int, dur: float):
         beats = beats[::2]
     if len(beats) < 4:
         raise SystemExit("no steady beat")
+    if dynamic:
+        # use the raw beats (they follow tempo changes); fill gaps by
+        # interpolation so sparse sections still get a grid
+        snap_ms = 0.0
+        # interpolate to fill gaps > 1.5x the median interval
+        if len(beats) > 2:
+            med = float(np.median(np.diff(beats)))
+            filled = [beats[0]]
+            for b0, b1 in zip(beats[:-1], beats[1:]):
+                gap = b1 - b0
+                if gap > 1.5 * med:
+                    n = int(round(gap / med))
+                    for k in range(1, n):
+                        filled.append(b0 + gap * k / n)
+                filled.append(b1)
+            beats = np.array(filled)
+        return beats, tempo, snap_ms
     bpm, phase = _refine_tempo(src_mono, sr, dur, tempo)
     period = 60.0 / bpm
     # The DP tracker often drops out in sparse sections (breakdowns,
@@ -1601,6 +1764,38 @@ def main() -> None:
                          "baladi = classic warm 4/4; maqsum = driving wedding "
                          "4/4; saidi = heavy Upper-Egypt 4/4; wahda = slow "
                          "spacious 4/4")
+    ap.add_argument("--iqa-tempo-mult", type=float, default=1.0,
+                    help="with --groove iqa: tempo multiplier. Use 2.0 if "
+                         "the beat tracker found half-time (e.g. 73 BPM "
+                         "when the song feels like 146)")
+    ap.add_argument("--tempo-bpm", type=float, default=0,
+                    help="override the beat-tracked tempo with a fixed BPM. "
+                         "The beat grid is regenerated at this tempo from "
+                         "the detected downbeat. Use when the tracker finds "
+                         "the wrong tempo (e.g. 73 instead of 113)")
+    ap.add_argument("--deluxe", action="store_true", default=False,
+                    help="with --groove iqa: richer arrangement -- more riq "
+                         "shimmer (verse + chorus), fills at phrase "
+                         "boundaries")
+    ap.add_argument("--vocal-pad", action="store_true", default=False,
+                    help="add synthesized vowel pads (ahh/ooh hums) as a "
+                         "backing layer at phrase starts, on the song's "
+                         "tonic")
+    ap.add_argument("--hum-solo", action="store_true", default=False,
+                    help="add a solo hum of the lead vocal's melody (lowpassed "
+                         "to sound like humming) in the intro and gaps where "
+                         "the lead is silent, like the Mishari intro")
+    ap.add_argument("--hum-sample", default="",
+                    help="use a real recorded human humming sample as the "
+                         "backing layer (e.g. samples/hum_deep.mp3). Loops "
+                         "to cover the song. Real human voice, not synth.")
+    ap.add_argument("--dum-for-tak", action="store_true", default=False,
+                    help="replace high tak/tek hits with deep DUMs -- for "
+                         "pop songs where the tak feels too baladi/folksy")
+    ap.add_argument("--dynamic-beats", action="store_true", default=False,
+                    help="follow tempo changes between sections instead of "
+                         "a rigid grid (for songs like Insan that shift "
+                         "tempo mid-song)")
     ap.add_argument("--groove-file", default="groove_ref.json",
                     help="with --groove lifted: JSON from extract_groove.py")
     ap.add_argument("--real-drums", action="store_true", default=False,
@@ -1658,7 +1853,7 @@ def main() -> None:
     mix_path = args.mix
     if args.url:
         # the product's link-in flow: fetch the song, then treat it as --mix
-        import subprocess, tempfile, os, sys
+        import subprocess, tempfile, sys
         print(f"downloading {args.url} ...", flush=True)
         tmpd = tempfile.mkdtemp(prefix="acapella-url-")
         mix_path = os.path.join(tmpd, "song.mp3")
@@ -1744,7 +1939,7 @@ def main() -> None:
     best = None
     for name, src in cands:
         try:
-            res = _track_grid(src, sr, dur)
+            res = _track_grid(src, sr, dur, dynamic=args.dynamic_beats)
         except SystemExit:
             continue
         print(f"  {name}: ~{res[1]:.0f} BPM, snap err {res[2]:.0f} ms",
@@ -1756,8 +1951,28 @@ def main() -> None:
                          "this works best on rhythmic music.")
     name, (beats, tempo_bpm, snap_ms) = best
     print(f"  using the {name} stem", flush=True)
-    # rotate the pattern so the kick lands on the true downbeat
     groove = librosa.to_mono(drums) if drums is not None else mono
+    # tempo override: regenerate the beat grid at the correct BPM
+    # (when the tracker finds half-time or the wrong tempo)
+    if args.tempo_bpm > 0:
+        true_bpm = args.tempo_bpm
+        # anchor on the TRUE downbeat from the original grid, not beats[0]
+        # (beats[0] might be beat 2 or 3, which shifts the whole grid)
+        groove_pre = librosa.to_mono(drums) if drums is not None else mono
+        auto_s_pre = _auto_shift(groove_pre, sr, beats)
+        # find the first downbeat in the original grid
+        shift_pre = (4 - auto_s_pre) % 4
+        db_idx = next((i for i in range(len(beats))
+                       if (i + shift_pre) % 4 == 0), 0)
+        t0 = float(beats[db_idx])
+        beat_dur = 60.0 / true_bpm
+        n_beats = int((dur - t0) / beat_dur) + 2
+        beats = np.array([t0 + i * beat_dur for i in range(n_beats)])
+        tempo_bpm = true_bpm
+        print(f"  tempo override: regenerating grid @ {true_bpm:.1f} BPM "
+              f"from downbeat t={t0:.2f}s", flush=True)
+    # rotate the pattern so the kick lands on the true downbeat
+    # (computed on the final grid, after any tempo override)
     auto_s = _auto_shift(groove, sr, beats)
     shift_eff = ((4 - auto_s) % 4 + args.shift_beats) % 4
     print(f"  downbeat at beat position {auto_s + 1}", flush=True)
@@ -1794,7 +2009,10 @@ def main() -> None:
                                            sample_dir=args.sample_dir,
                                            real_dum=args.real_dum,
                                            add_riq=args.riq,
-                                           is_chorus=is_chorus)
+                                           is_chorus=is_chorus,
+                                           tempo_mult=args.iqa_tempo_mult,
+                                           deluxe=args.deluxe,
+                                           dum_for_tak=args.dum_for_tak)
             groove_desc = f"iqa' {args.iqa}"
         elif args.groove == "lifted" and drum_mono is not None:
             # replay the reference's transcribed groove (its phrases,
@@ -1820,7 +2038,8 @@ def main() -> None:
                                               real_dum=args.real_dum,
                                               add_riq=args.riq,
                                               add_fills=args.fills,
-                                              is_chorus=is_chorus)
+                                              is_chorus=is_chorus,
+                                              dum_for_tak=args.dum_for_tak)
             groove_desc = "lifted reference groove"
         elif len(hits) >= 20 and args.groove in ("dense", "dum"):
             # duff groove at the voice's own tempo, each bar re-locked to
@@ -1913,6 +2132,78 @@ def main() -> None:
                   flush=True)
             bus = bus + haas_widen(librosa.to_mono(vocals), sr,
                                    delay_ms=25.0, gain_db=args.hum_db)
+    # vowel pads (ahh/ooh hums) as a backing layer at phrase starts
+    if args.vocal_pad:
+        print("adding vowel pads (ahh/ooh) ...", flush=True)
+        tonic = detect_tonic(librosa.to_mono(vocals), sr)
+        print(f"  tonic ~{tonic:.0f} Hz", flush=True)
+        # one pad per 4-bar phrase, alternating ahh/ooh, on the tonic
+        # (and a fifth above in the chorus for lift)
+        bs = locals().get('bar_starts')
+        if bs is not None and len(bs) > 0:
+            pad_starts = bs[::4]
+        else:
+            # fall back to beat-derived bars
+            pad_starts = beats[::16] if len(beats) > 16 else beats[::4]
+        for pi, ps in enumerate(pad_starts):
+            ps = float(ps)
+            if ps * sr >= n_samples:
+                continue
+            ch = bool(is_chorus[min(pi * 4, len(is_chorus) - 1)]) \
+                if len(is_chorus) > 0 else False
+            vowel = "ahh" if pi % 2 == 0 else "ooh"
+            # chorus lifts to the fifth for a brighter feel
+            # deep warm hum like Mishari's nasheeds: tonic an octave down
+            # (bass range), plus a fifth above for harmony
+            freq = (tonic / 2.0) * (1.5 if (ch and pi % 4 == 2) else 1.0)
+            # pad lasts the full 4-bar phrase (continuous bed, not 1 bar
+            # that stops) -- next phrase overlaps slightly via the release
+            pad_dur = min(16 * 60.0 / tempo_bpm, (n_samples / sr) - ps)
+            if pad_dur < 0.5:
+                continue
+            pad = vowel_pad(sr, pad_dur, freq, vowel=vowel, gain=0.18)
+            # harmony voice: a fifth above, quieter, for a choir feel
+            pad_h = vowel_pad(sr, pad_dur, freq * 1.5, vowel=vowel,
+                              gain=0.10)
+            pad = pad + pad_h
+            idx = int(ps * sr)
+            end = min(idx + len(pad), n_samples)
+            # gentle stereo spread
+            bus[0, idx:end] += pad[:end - idx] * 0.9
+            bus[1, idx:end] += pad[:end - idx] * 0.9
+    # warm hum backing (Mishari-style): the vocal itself, lowpassed to
+    # sound like humming, as a CONTINUOUS backing layer under the lead --
+    # it follows the melody and spices up the whole mix
+    if args.hum_solo:
+        print("adding warm hum backing ...", flush=True)
+        hum = hum_solo(librosa.to_mono(vocals), sr, gain=0.5)
+        # continuous backing, no gating -- sits under the lead vocal
+        bus[0] += hum * 0.9
+        bus[1] += hum * 0.9
+    # real recorded human humming sample as the backing layer
+    if args.hum_sample:
+        print(f"adding real hum sample ({args.hum_sample}) ...", flush=True)
+        import librosa
+        hum_samp, _ = librosa.load(args.hum_sample, sr=sr, mono=True)
+        hum_samp = hum_samp.astype(np.float32)
+        # normalize and loop to cover the song
+        peak = np.abs(hum_samp).max()
+        if peak > 1e-6:
+            hum_samp = hum_samp / peak * 0.25  # quiet backing
+        # loop the sample to fill the song duration
+        n_reps = int(np.ceil(n_samples / len(hum_samp))) + 1
+        hum_full = np.tile(hum_samp, n_reps)[:n_samples]
+        # crossfade the loop joints to avoid clicks
+        # (simple: apply a short fade at each loop boundary)
+        loop_len = len(hum_samp)
+        fade = int(0.1 * sr)
+        for start in range(loop_len, n_samples, loop_len):
+            if start + fade < n_samples:
+                w = np.linspace(0, 1, fade, dtype=np.float32)
+                hum_full[start:start + fade] *= w
+                hum_full[start - fade:start] *= (1 - w)
+        bus[0] += hum_full * 0.9
+        bus[1] += hum_full * 0.9
     # breathy riser swelling into each chorus entrance
     n_risers = 0
     for b in range(1, len(is_chorus)):
